@@ -38,8 +38,10 @@ Pour répondre à ce besoin, nous avons créé BlindEYE, un dispositif intellige
 
 # Liste des composants
 <img width="436" height="224" alt="image" src="https://github.com/user-attachments/assets/45bb8f8e-1926-4d54-b584-1bdd83d4adc5" />
+<br\>
 # Architecture générale du système
 <img width="377" height="241" alt="image" src="https://github.com/user-attachments/assets/470e7404-1e24-4580-bba9-e2e46fb34207" />
+<br\>
 # Model 3D
 
 # Conclusion
