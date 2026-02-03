@@ -1,0 +1,26 @@
+{
+  "name": "tts",
+  "version": "1.0.0",
+  "description": "",
+  "main": "test.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.34.0",
+    "axios": "^1.13.4",
+    "child_process": "^1.0.2",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "fs": "^0.0.1-security",
+    "path": "^0.12.7",
+    "play-sound": "^1.1.6",
+    "say": "^0.16.0",
+    "stream": "^0.0.3",
+    "util": "^0.12.5"
+  }
+}
