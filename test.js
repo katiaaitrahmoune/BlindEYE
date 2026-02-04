@@ -1,50 +1,31 @@
-const gtts = require('gtts');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const fs = require('fs');
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+const https = require('https');
+const googleTTS = require('google-tts-api');
 
-async function textToWav(text, language = 'en', outputFile = 'output.wav') {
-    return new Promise((resolve, reject) => {
-        try {
-            const tempMp3 = `temp_${Date.now()}.mp3`;
-            const gttsObj = new gtts(text, language);
-            
+async function main() {
+    try {
+        const text = 'hi this is blind eye';
+
         
-            gttsObj.save(tempMp3, (err) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                
-                console.log('MP3 created, converting to WAV...');
-                
-              
-                ffmpeg(tempMp3)
-                    .toFormat('wav')
-                    .audioChannels(1)  
-                    .audioFrequency(16000)  
-                    .on('end', () => {
-                        console.log(`WAV file saved as: ${outputFile}`);
-                        
-                  
-                        fs.unlinkSync(tempMp3);
-                        resolve(outputFile);
-                    })
-                    .on('error', (err) => {
-                        console.error('Conversion error:', err);
-                        fs.unlinkSync(tempMp3);  
-                        reject(err);
-                    })
-                    .save(outputFile);
+        const url = googleTTS.getAudioUrl(text, {
+            lang: 'en',
+            slow: false,
+            host: 'https://translate.google.com',
+        });
+
+        
+        const file = fs.createWriteStream('output.wav');
+        https.get(url, (res) => {
+            res.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                console.log(' Audio saved as output.mp3');
             });
-        } catch (error) {
-            reject(error);
-        }
-    });
+        });
+
+    } catch (err) {
+        console.error(' TTS error:', err);
+    }
 }
-textToWav('hi !this is blind eye ,welcome here im excited to help you ', 'en', 'hello.wav')
-    .then(filename => {
-        console.log(`Successfully saved: ${filename}`);
-    })
-    .catch(err => console.error(err));
+
+main();
