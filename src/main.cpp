@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
 const char* ssid = "katia";
@@ -28,11 +27,24 @@ const char* password = "katia2005";
 
 #define BUTTON 21
 
-const char* imageUrl = "https://hosted-server-vufd.onrender.com/upload/image";
+// ==== NGROK SERVER (update when ngrok restarts) ====
+const char* serverBase = "https://spry-envelope-angular.ngrok-free.dev";
+const char* sessionId  = "liveSession1";
 
-// ==== SEND IMAGE ====
-void sendSnapshot(String sessionId) {
-  // Discard one stale frame first, so what we actually send is genuinely fresh
+bool connectWithRetry(WiFiClientSecure& client, const char* host) {
+  client.setInsecure();
+  client.setHandshakeTimeout(30);   // seconds
+  for (int i = 1; i <= 3; i++) {
+    if (client.connect(host, 443)) return true;
+    Serial.printf("TLS connect failed (try %d/3)\n", i);
+    client.stop();
+    delay(1500);
+  }
+  return false;
+}
+
+void sendSnapshot() {
+  // Discard one stale frame so the sent one is fresh
   camera_fb_t* stale = esp_camera_fb_get();
   if (stale) esp_camera_fb_return(stale);
 
@@ -42,53 +54,79 @@ void sendSnapshot(String sessionId) {
     return;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    String url = String(imageUrl) + "?session_id=" + sessionId;
-    http.begin(client, url);
-    http.setTimeout(60000);
-    http.setConnectTimeout(60000);
-
-    String boundary = "BlindEyeBoundary";
-    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-
-    String head = "--" + boundary + "\r\n";
-    head += "Content-Disposition: form-data; name=\"image\"; filename=\"snap.jpg\"\r\n";
-    head += "Content-Type: image/jpeg\r\n\r\n";
-    String tail = "\r\n--" + boundary + "--\r\n";
-
-    uint32_t totalLen = head.length() + fb->len + tail.length();
-    http.addHeader("Content-Length", String(totalLen));
-
-    uint8_t* body = (uint8_t*)malloc(totalLen);
-    if (body) {
-      memcpy(body, head.c_str(), head.length());
-      memcpy(body + head.length(), fb->buf, fb->len);
-      memcpy(body + head.length() + fb->len, tail.c_str(), tail.length());
-
-      int httpCode = http.POST(body, totalLen);
-      free(body);
-
-      Serial.printf("Image upload code: %d\n", httpCode);
-      if (httpCode > 0) {
-        Serial.println(http.getString());
-      }
-    } else {
-      Serial.println("malloc failed — not enough memory");
-    }
-
-    http.end();
-  } else {
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected");
+    esp_camera_fb_return(fb);
+    return;
   }
+
+  Serial.printf("Free heap before HTTPS connect: %u bytes\n", ESP.getFreeHeap());
+
+  String boundary = "BlindEyeBoundary";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"image\"; filename=\"snap.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  uint32_t bodyLen = head.length() + fb->len + tail.length();
+
+  // Clean host: strip scheme, spaces and trailing slash
+  String hostOnly = String(serverBase);
+  hostOnly.replace("https://", "");
+  hostOnly.replace("http://", "");
+  hostOnly.trim();
+  if (hostOnly.endsWith("/")) hostOnly.remove(hostOnly.length() - 1);
+
+  WiFiClientSecure client;
+  if (!connectWithRetry(client, hostOnly.c_str())) {
+    Serial.println("Connection to server failed");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  String path = "/upload/image?session_id=" + String(sessionId);
+
+  client.print(String("POST ") + path + " HTTP/1.1\r\n");
+  client.print(String("Host: ") + hostOnly + "\r\n");
+  client.print("ngrok-skip-browser-warning: 1\r\n");
+  client.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
+  client.print("Content-Length: " + String(bodyLen) + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  client.print(head);
+  if (client.write(fb->buf, fb->len) != fb->len) {
+    Serial.println("Image write failed");
+    client.stop();
+    esp_camera_fb_return(fb);
+    return;
+  }
+  client.print(tail);
+
+  Serial.println("Upload sent, waiting for response...");
+
+  // If the S3 audio came first, the server runs the full pipeline before answering
+  unsigned long timeout = millis();
+  while (client.connected() && !client.available()) {
+    if (millis() - timeout > 60000) {
+      Serial.println("Response timeout");
+      client.stop();
+      esp_camera_fb_return(fb);
+      return;
+    }
+    delay(10);
+  }
+
+  while (client.available()) {
+    String line = client.readStringUntil('\n');
+    Serial.println(line);
+  }
+
+  client.stop();
+  Serial.println("Upload complete.");
 
   esp_camera_fb_return(fb);
 }
 
-// ==== SETUP ====
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
@@ -114,9 +152,7 @@ void setup() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-
-  // ---- Fixes for stale/old frames ----
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
     config.frame_size   = FRAMESIZE_VGA;
@@ -136,7 +172,6 @@ void setup() {
     return;
   }
 
-  // ---- Sensor tuning for brightness/exposure ----
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
     s->set_brightness(s, 1);
@@ -148,10 +183,12 @@ void setup() {
     s->set_gain_ctrl(s, 1);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
-    s->set_vflip(s, 1);   // flip vertically -- try 1 first, set back to 0 if it looks wrong
-    s->set_hmirror(s, 0); // mirror horizontally if left/right also look swapped
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 0);
   }
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                 // avoids dropped TLS connections
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -160,31 +197,19 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
 
-  // ---- DNS FIX ----
-  Serial.print("DNS before override: ");
-  Serial.println(WiFi.dnsIP());
-
   IPAddress dns1(8, 8, 8, 8);
   IPAddress dns2(1, 1, 1, 1);
   WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
 
-  Serial.print("DNS after override: ");
-  Serial.println(WiFi.dnsIP());
-
   pinMode(BUTTON, INPUT_PULLUP);
+  Serial.println("Ready. Press button to capture and send photo.");
 }
 
-// ==== LOOP ====
 void loop() {
   if (digitalRead(BUTTON) == LOW) {
-    Serial.println("Button pressed!");
-
-    String sessionId = "esp32-" + String(millis());
-    Serial.println("Session ID: " + sessionId);
-
-    sendSnapshot(sessionId);
-
-    delay(5000);
+    Serial.println("Button pressed! Capturing photo...");
+    sendSnapshot();
+    delay(2000);   // debounce / cooldown
   }
   delay(1);
 }
