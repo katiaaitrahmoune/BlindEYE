@@ -1,31 +1,142 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <ESP_I2S.h>
 
-const char* ssid = "katia";
+const char* ssid     = "katia";
 const char* password = "katia2005";
 
-// ==== I2S / MAX98357A PINS ====
-// Change these if they conflict with anything else on your board.
-#define I2S_BCLK  15
-#define I2S_LRC   16
-#define I2S_DOUT  17
+// ==== NGROK (host only, no https://) ====
+const char* serverHost = "spry-envelope-angular.ngrok-free.dev"; 
+const char* sessionId  = "liveSession1";
 
-I2SClass I2S;
+#define BUTTON   21
 
-const char* speechUrl = "https://res.cloudinary.com/digsropir/video/upload/v1784405182/blindeye/tts/ty6swflclj8akm5lfvuy.wav";
+// Mic (INMP441)
+#define MIC_SCK  4
+#define MIC_WS   5
+#define MIC_SD   6
 
-// ==== Parse the 44-byte standard WAV header ====
-struct WavInfo {
-  uint16_t numChannels;
-  uint32_t sampleRate;
-  uint16_t bitsPerSample;
-};
+// Speaker (MAX98357A)
+#define SPK_BCLK 15
+#define SPK_LRC  16
+#define SPK_DOUT 17
 
-bool parseWavHeader(const uint8_t* h, WavInfo &info) {
+I2SClass I2S;                 // speaker
+I2SClass I2Smic(I2S_NUM_1);   // mic
+
+#define SAMPLE_RATE      16000
+#define MAX_RECORD_SEC   5
+#define BYTES_PER_SAMPLE 2
+#define MAX_SAMPLES      (SAMPLE_RATE * MAX_RECORD_SEC)
+
+int16_t* recordBuffer = nullptr;
+size_t recordedSamples = 0;
+bool isRecording = false;
+
+void writeWavHeader(uint8_t* h, uint32_t dataSize, uint32_t sampleRate) {
+  uint32_t byteRate = sampleRate * 2;
+  uint32_t chunkSize = 36 + dataSize;
+  memcpy(h, "RIFF", 4);
+  h[4] = chunkSize; h[5] = chunkSize >> 8; h[6] = chunkSize >> 16; h[7] = chunkSize >> 24;
+  memcpy(h + 8, "WAVE", 4);
+  memcpy(h + 12, "fmt ", 4);
+  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;
+  h[20] = 1; h[21] = 0;
+  h[22] = 1; h[23] = 0;
+  h[24] = sampleRate; h[25] = sampleRate >> 8; h[26] = sampleRate >> 16; h[27] = sampleRate >> 24;
+  h[28] = byteRate; h[29] = byteRate >> 8; h[30] = byteRate >> 16; h[31] = byteRate >> 24;
+  h[32] = 2; h[33] = 0;
+  h[34] = 16; h[35] = 0;
+  memcpy(h + 36, "data", 4);
+  h[40] = dataSize; h[41] = dataSize >> 8; h[42] = dataSize >> 16; h[43] = dataSize >> 24;
+}
+
+String extractUrl(const String& body) {
+  int k = body.indexOf("\"url\"");
+  if (k < 0) return "";
+  int colon = body.indexOf(':', k);
+  if (colon < 0) return "";
+  int q1 = body.indexOf('"', colon + 1);
+  if (q1 < 0) return "";
+  int q2 = body.indexOf('"', q1 + 1);
+  if (q2 < 0) return "";
+  return body.substring(q1 + 1, q2);
+}
+
+String uploadRecording() {
+  if (recordedSamples == 0) { Serial.println("Nothing recorded"); return ""; }
+
+  uint32_t dataSize = recordedSamples * BYTES_PER_SAMPLE;
+  uint8_t wavHeader[44];
+  writeWavHeader(wavHeader, dataSize, SAMPLE_RATE);
+
+  String boundary = "BlindEyeAudioBoundary";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"audio\"; filename=\"rec.wav\"\r\n";
+  head += "Content-Type: audio/wav\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  uint32_t bodyLen = head.length() + 44 + dataSize + tail.length();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  Serial.printf("Free heap before connect: %u\n", ESP.getFreeHeap());
+
+  if (!client.connect(serverHost, 443)) {
+    Serial.println("Connection to server failed");
+    return "";
+  }
+
+  client.print(String("POST /upload/audio?session_id=") + sessionId + " HTTP/1.1\r\n");
+  client.print(String("Host: ") + serverHost + "\r\n");
+  client.print("ngrok-skip-browser-warning: 1\r\n");
+  client.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
+  client.print("Content-Length: " + String(bodyLen) + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  client.print(head);
+  client.write(wavHeader, 44);
+
+  uint8_t* raw = (uint8_t*)recordBuffer;
+  uint32_t sent = 0;
+  while (sent < dataSize) {
+    size_t n = min((uint32_t)1024, dataSize - sent);
+    client.write(raw + sent, n);
+    sent += n;
+  }
+  client.print(tail);
+
+  Serial.println("Upload sent, waiting for server (Whisper+Gemini+TTS)...");
+
+  unsigned long t0 = millis();
+  while (client.connected() && !client.available()) {
+    if (millis() - t0 > 75000) {
+      Serial.println("Response timeout");
+      client.stop();
+      return "";
+    }
+    delay(50);
+  }
+
+  String resp;
+  unsigned long last = millis();
+  while ((client.connected() || client.available()) && millis() - last < 3000) {
+    while (client.available()) { resp += (char)client.read(); last = millis(); }
+    delay(5);
+  }
+  client.stop();
+
+  String url = extractUrl(resp);
+  if (url.length() == 0) Serial.println(resp);   // show server error for debugging
+  else Serial.println(resp.substring(0, resp.indexOf('\n')));
+  return url;
+}
+
+struct WavInfo { uint16_t numChannels; uint32_t sampleRate; uint16_t bitsPerSample; };
+
+bool parseWavHeader(const uint8_t* h, WavInfo& info) {
   if (memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) {
-    Serial.println("Not a valid WAV file (missing RIFF/WAVE header)");
+    Serial.println("Not a valid WAV");
     return false;
   }
   info.numChannels   = h[22] | (h[23] << 8);
@@ -34,122 +145,133 @@ bool parseWavHeader(const uint8_t* h, WavInfo &info) {
   return true;
 }
 
-// ==== Stream WAV from URL straight to I2S, no big buffers, no PSRAM needed ====
 void playWavFromUrl(const char* url) {
   WiFiClientSecure client;
   client.setInsecure();
-
   HTTPClient http;
   http.begin(client, url);
-  int httpCode = http.GET();
-  Serial.printf("HTTP GET code: %d\n", httpCode);
-
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.println("Failed to fetch audio file");
-    http.end();
-    return;
-  }
+  int code = http.GET();
+  Serial.printf("Audio GET: %d\n", code);
+  if (code != HTTP_CODE_OK) { http.end(); return; }
 
   WiFiClient* stream = http.getStreamPtr();
-
-  // Read the 44-byte WAV header
   uint8_t header[44];
   size_t got = 0;
-  unsigned long startWait = millis();
+  unsigned long w = millis();
   while (got < 44) {
-    if (stream->available()) {
-      int n = stream->readBytes(header + got, 44 - got);
-      got += n;
-    } else if (millis() - startWait > 10000) {
-      Serial.println("Timed out waiting for WAV header");
-      http.end();
-      return;
-    }
+    if (stream->available()) got += stream->readBytes(header + got, 44 - got);
+    else if (millis() - w > 10000) { Serial.println("Header timeout"); http.end(); return; }
   }
 
   WavInfo info;
-  if (!parseWavHeader(header, info)) {
-    http.end();
-    return;
-  }
+  if (!parseWavHeader(header, info)) { http.end(); return; }
 
-  Serial.printf("WAV info -> channels: %d, sampleRate: %lu, bitsPerSample: %d\n",
-                info.numChannels, info.sampleRate, info.bitsPerSample);
-
-  // Map bits per sample to I2S data width
-  i2s_data_bit_width_t bitWidth;
+  i2s_data_bit_width_t bw;
   switch (info.bitsPerSample) {
-    case 8:  bitWidth = I2S_DATA_BIT_WIDTH_8BIT;  break;
-    case 16: bitWidth = I2S_DATA_BIT_WIDTH_16BIT; break;
-    case 24: bitWidth = I2S_DATA_BIT_WIDTH_24BIT; break;
-    case 32: bitWidth = I2S_DATA_BIT_WIDTH_32BIT; break;
-    default:
-      Serial.println("Unsupported bits-per-sample in WAV file");
-      http.end();
-      return;
+    case 8:  bw = I2S_DATA_BIT_WIDTH_8BIT;  break;
+    case 16: bw = I2S_DATA_BIT_WIDTH_16BIT; break;
+    case 24: bw = I2S_DATA_BIT_WIDTH_24BIT; break;
+    case 32: bw = I2S_DATA_BIT_WIDTH_32BIT; break;
+    default: http.end(); return;
   }
+  i2s_slot_mode_t slot = (info.numChannels == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
 
-  i2s_slot_mode_t slotMode = (info.numChannels == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
-
-  if (!I2S.begin(I2S_MODE_STD, info.sampleRate, bitWidth, slotMode)) {
-    Serial.println("Failed to start I2S");
+  I2S.setPins(SPK_BCLK, SPK_LRC, SPK_DOUT);
+  if (!I2S.begin(I2S_MODE_STD, info.sampleRate, bw, slot)) {
+    Serial.println("I2S speaker start failed");
     http.end();
     return;
   }
 
-  // Stream the rest of the body straight to the speaker in small chunks
-  int contentLength = http.getSize(); // total body size (includes the 44-byte header), -1 if unknown
-  int remaining = (contentLength > 0) ? (contentLength - 44) : -1;
-
+  int len = http.getSize();
+  int remaining = (len > 0) ? (len - 44) : -1;
   uint8_t buf[512];
-  Serial.println("Streaming audio...");
-
+  Serial.println("Playing...");
   while (http.connected() && (remaining > 0 || remaining == -1)) {
     size_t avail = stream->available();
     if (avail) {
-      size_t toRead = min(avail, sizeof(buf));
-      int n = stream->readBytes(buf, toRead);
-      if (n > 0) {
-        I2S.write(buf, n);
-        if (remaining > 0) remaining -= n;
-      }
-    } else if (!http.connected()) {
-      break;
-    } else {
-      delay(1);
-    }
+      int n = stream->readBytes(buf, min(avail, sizeof(buf)));
+      if (n > 0) { I2S.write(buf, n); if (remaining > 0) remaining -= n; }
+    } else delay(1);
   }
-
   Serial.println("Playback finished");
   I2S.end();
   http.end();
 }
 
+void startRecording() {
+  if (!recordBuffer) {
+    size_t bytes = MAX_SAMPLES * sizeof(int16_t);
+    recordBuffer = psramFound() ? (int16_t*)ps_malloc(bytes) : (int16_t*)malloc(bytes);
+    if (!recordBuffer) { Serial.println("Buffer alloc failed"); return; }
+  }
+  recordedSamples = 0;
+  I2Smic.setPins(MIC_SCK, MIC_WS, -1, MIC_SD);
+  if (!I2Smic.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("Mic start failed");
+    return;
+  }
+  isRecording = true;
+  Serial.println("Recording... speak now (press again to stop)");
+}
+
+void stopRecordingAndRun() {
+  isRecording = false;
+  I2Smic.end();
+  Serial.printf("Captured %.2f sec\n", (float)recordedSamples / SAMPLE_RATE);
+
+  String url = uploadRecording();
+
+  free(recordBuffer);
+  recordBuffer = nullptr;
+
+  if (url.length()) {
+    Serial.println("Audio URL: " + url);
+    playWavFromUrl(url.c_str());
+  } else {
+    Serial.println("No audio URL received");
+  }
+}
+
+void recordChunk() {
+  const int frames = 256;
+  int32_t raw[frames];
+  size_t bytesRead = I2Smic.readBytes((char*)raw, frames * sizeof(int32_t));
+  int n = bytesRead / sizeof(int32_t);
+  for (int i = 0; i < n; i++) {
+    if (recordedSamples >= MAX_SAMPLES) {
+      Serial.println("Max length reached");
+      stopRecordingAndRun();
+      return;
+    }
+    recordBuffer[recordedSamples++] = (int16_t)(raw[i] >> 16);
+  }
+}
+
+bool lastButtonState = HIGH;
+void handleButton() {
+  bool cur = digitalRead(BUTTON);
+  if (lastButtonState == HIGH && cur == LOW) {
+    if (!isRecording) startRecording();
+    else stopRecordingAndRun();
+    delay(300);
+    cur = digitalRead(BUTTON);
+  }
+  lastButtonState = cur;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
-
+  pinMode(BUTTON, INPUT_PULLUP);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
-
-  I2S.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
-
-  Serial.println("Playing speech...");
-  playWavFromUrl(speechUrl);
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  Serial.println("Ready. Press button to record.");
 }
 
 void loop() {
-  // Replay every 10s for easy testing. Remove once confirmed working.
-  static unsigned long lastPlay = 0;
-  if (millis() - lastPlay > 10000) {
-    lastPlay = millis();
-    Serial.println("Replaying speech...");
-    playWavFromUrl(speechUrl);
-  }
+  handleButton();
+  if (isRecording) recordChunk();
 }
